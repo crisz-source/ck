@@ -1,3 +1,5 @@
 dist/
 ck
 *.exe
+.ck.yaml
+*.tar.gz
