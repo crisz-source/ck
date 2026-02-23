@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION="0.2.0"
+VERSION="0.2.2"
 OUTPUT_DIR="dist"
 
 mkdir -p $OUTPUT_DIR
