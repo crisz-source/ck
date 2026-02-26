@@ -74,7 +74,6 @@ func initConfig() {
 	// Defaults (menor prioridade)
 	// namespace: SEM default → se não tiver config, fica "" → mantém o -A
 	viper.SetDefault("tail", "100")
-	viper.SetDefault("scan.severity", "CRITICAL,HIGH")
 
 	// Lê o arquivo de config
 	if err := viper.ReadInConfig(); err != nil {

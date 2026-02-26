@@ -6,7 +6,7 @@ O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.
 
 ---
 
-## [0.3.0] - 2026-02-23
+## [0.3.0] - 2026-02-23\
 
 ### Adicionado
 - **`ck watch`** — Monitoramento de pods em tempo real usando Kubernetes Informers

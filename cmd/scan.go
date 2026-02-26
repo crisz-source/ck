@@ -7,18 +7,15 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"    
+	"github.com/spf13/viper"
 )
-
-
-// var severityFilter string
 
 var scanCmd = &cobra.Command{
 	Use:   "scan [imagem]",
 	Short: "Scan de vulnerabilidades em imagem Docker",
 	Example: `  ck scan nginx:latest
-  ck scan php-worker:latest -s CRITICAL
-  ck scan myregistry/app:v1.0 -s HIGH,CRITICAL`,
+  ck scan nginx:latest -s CRITICAL,HIGH
+  ck scan nginx:latest --no-secrets`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		image := args[0]
@@ -29,23 +26,24 @@ var scanCmd = &cobra.Command{
 func init() {
 	RootCmd.AddCommand(scanCmd)
 
+	scanCmd.Flags().StringP("severity", "s", "", "Filtrar por severidade (ex: CRITICAL,HIGH)")
+	scanCmd.Flags().Bool("no-secrets", false, "Desabilitar scan de secrets")
 
-	// scanCmd.Flags().StringVarP(&severityFilter, "severity", "s", "HIGH,CRITICAL", "...")
-
-
-	scanCmd.Flags().StringP("severity", "s", "", "Filtrar por severidade")
 	viper.BindPFlag("scan.severity", scanCmd.Flags().Lookup("severity"))
+	viper.BindPFlag("scan.no_secrets", scanCmd.Flags().Lookup("no-secrets"))
 }
 
-// As structs TrivyReport, TrivyResult, TrivyVuln ficam IGUAIS
+// Structs para parsear JSON do Trivy
 
 type TrivyReport struct {
 	Results []TrivyResult `json:"Results"`
 }
 
 type TrivyResult struct {
-	Target          string      `json:"Target"`
-	Vulnerabilities []TrivyVuln `json:"Vulnerabilities"`
+	Target          string        `json:"Target"`
+	Class           string        `json:"Class"`
+	Vulnerabilities []TrivyVuln   `json:"Vulnerabilities"`
+	Secrets         []TrivySecret `json:"Secrets"`
 }
 
 type TrivyVuln struct {
@@ -55,6 +53,22 @@ type TrivyVuln struct {
 	FixedVersion     string `json:"FixedVersion"`
 	Severity         string `json:"Severity"`
 	Title            string `json:"Title"`
+	PrimaryURL       string `json:"PrimaryURL"`
+}
+
+type TrivySecret struct {
+	RuleID    string `json:"RuleID"`
+	Category  string `json:"Category"`
+	Severity  string `json:"Severity"`
+	Title     string `json:"Title"`
+	Match     string `json:"Match"`
+	StartLine int    `json:"StartLine"`
+	EndLine   int    `json:"EndLine"`
+}
+
+type secretWithTarget struct {
+	TrivySecret
+	Target string
 }
 
 func scanImage(image string) {
@@ -69,20 +83,37 @@ func scanImage(image string) {
 		return
 	}
 
-	severity := viper.GetString("scan.severity")    // ← TROCA severityFilter
+	severity := viper.GetString("scan.severity")
+	noSecrets := viper.GetBool("scan.no_secrets")
 
-	fmt.Printf("=== SCAN: %s ===\n", image)
-	fmt.Printf("Severidade: %s\n", severity)
+	scanners := "vuln,secret"
+	if noSecrets {
+		scanners = "vuln"
+	}
+
+	// Header
+	fmt.Println(strings.Repeat("=", 71))
+	fmt.Printf("  SCAN: %s\n", image)
+	fmt.Println(strings.Repeat("=", 71))
+	fmt.Println("")
+
+	if severity != "" {
+		fmt.Printf("Severidade: %s\n", severity)
+	}
 	fmt.Println("Escaneando... (pode demorar alguns segundos)")
 	fmt.Println("")
 
+	// Build trivy args
 	args := []string{
 		"image",
 		"--format", "json",
-		"--severity", severity,    // ← USA severity do Viper
+		"--scanners", scanners,
 		"--quiet",
-		image,
 	}
+	if severity != "" {
+		args = append(args, "--severity", severity)
+	}
+	args = append(args, image)
 
 	out, err := exec.Command("trivy", args...).Output()
 	if err != nil {
@@ -93,93 +124,198 @@ func scanImage(image string) {
 	}
 
 	var report TrivyReport
-	err = json.Unmarshal(out, &report)
-	if err != nil {
+	if err := json.Unmarshal(out, &report); err != nil {
 		fmt.Println("Erro ao parsear resultado:", err)
 		return
 	}
 
-	counts := map[string]int{
-		"CRITICAL": 0,
-		"HIGH":     0,
-		"MEDIUM":   0,
-		"LOW":      0,
-	}
+	// Coletar vulns e secrets
+	vulnCounts := map[string]int{"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+	secretCounts := map[string]int{"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
 
 	var allVulns []TrivyVuln
+	var allSecrets []secretWithTarget
 
 	for _, result := range report.Results {
 		for _, vuln := range result.Vulnerabilities {
-			counts[vuln.Severity]++
+			vulnCounts[vuln.Severity]++
 			allVulns = append(allVulns, vuln)
+		}
+		for _, secret := range result.Secrets {
+			secretCounts[secret.Severity]++
+			allSecrets = append(allSecrets, secretWithTarget{secret, result.Target})
 		}
 	}
 
-	total := counts["CRITICAL"] + counts["HIGH"] + counts["MEDIUM"] + counts["LOW"]
+	totalVulns := vulnCounts["CRITICAL"] + vulnCounts["HIGH"] + vulnCounts["MEDIUM"] + vulnCounts["LOW"]
+	totalSecrets := secretCounts["CRITICAL"] + secretCounts["HIGH"] + secretCounts["MEDIUM"] + secretCounts["LOW"]
 
-	if total == 0 {
-		fmt.Println("[OK] Nenhuma vulnerabilidade encontrada!")
+	if totalVulns == 0 && totalSecrets == 0 {
+		fmt.Println("[OK] Nenhuma vulnerabilidade ou secret encontrado!")
 		return
 	}
 
-	fmt.Println("RESUMO:")
-	if counts["CRITICAL"] > 0 {
-		fmt.Printf("  [!] CRITICAL: %d\n", counts["CRITICAL"])
+	// RESUMO
+	fmt.Println("RESUMO")
+	boxSep := "+" + strings.Repeat("-", 37) + "+"
+
+	fmt.Println(boxSep)
+	fmt.Printf("| %-35s |\n", "VULNERABILIDADES")
+	if totalVulns == 0 {
+		fmt.Printf("| %-35s |\n", "  Nenhuma encontrada")
+	} else {
+		for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW"} {
+			if vulnCounts[sev] > 0 {
+				indicator := "[-]"
+				if sev == "CRITICAL" || sev == "HIGH" {
+					indicator = "[!]"
+				}
+				line := fmt.Sprintf("  %s %-8s: %d", indicator, sev, vulnCounts[sev])
+				fmt.Printf("| %-35s |\n", line)
+			}
+		}
 	}
-	if counts["HIGH"] > 0 {
-		fmt.Printf("  [!] HIGH:     %d\n", counts["HIGH"])
+
+	if !noSecrets {
+		fmt.Println(boxSep)
+		fmt.Printf("| %-35s |\n", "SECRETS EXPOSTOS")
+		if totalSecrets == 0 {
+			fmt.Printf("| %-35s |\n", "  Nenhum encontrado")
+		} else {
+			for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW"} {
+				if secretCounts[sev] > 0 {
+					indicator := "[-]"
+					if sev == "CRITICAL" || sev == "HIGH" {
+						indicator = "[!]"
+					}
+					line := fmt.Sprintf("  %s %-8s: %d", indicator, sev, secretCounts[sev])
+					fmt.Printf("| %-35s |\n", line)
+				}
+			}
+		}
 	}
-	if counts["MEDIUM"] > 0 {
-		fmt.Printf("  [-] MEDIUM:   %d\n", counts["MEDIUM"])
-	}
-	if counts["LOW"] > 0 {
-		fmt.Printf("  [-] LOW:      %d\n", counts["LOW"])
-	}
-	fmt.Printf("      TOTAL:    %d\n", total)
+	fmt.Println(boxSep)
 	fmt.Println("")
 
-	fmt.Println("VULNERABILIDADES:")
-	fmt.Println(strings.Repeat("-", 95))
-	fmt.Printf("%-10s %-18s %-25s %-15s %s\n",
-		"SEVERIDADE", "CVE", "PACOTE", "VERSAO", "FIX")
-	fmt.Println(strings.Repeat("-", 95))
+	// Tabela de VULNERABILIDADES (larguras dinamicas, sem cortar nada)
+	if totalVulns > 0 {
+		fmt.Println("VULNERABILIDADES")
 
-	shown := 0
-	for _, vuln := range allVulns {
-		if shown >= 20 {
-			fmt.Printf("\n... e mais %d vulnerabilidades\n", len(allVulns)-20)
-			break
+		// Calcular largura de cada coluna baseado nos dados reais
+		sevW := len("SEVER.")
+		cveW := len("CVE")
+		pkgW := len("PACOTE")
+		verW := len("VERSAO")
+		fixW := len("FIX")
+		linkW := len("LINK")
+
+		limit := len(allVulns)
+		if limit > 20 {
+			limit = 20
 		}
 
-		pkgName := vuln.PkgName
-		if len(pkgName) > 25 {
-			pkgName = pkgName[:22] + "..."
+		for i := 0; i < limit; i++ {
+			vuln := allVulns[i]
+			sevW = maxInt(sevW, len(vuln.Severity))
+			cveW = maxInt(cveW, len(vuln.VulnerabilityID))
+			pkgW = maxInt(pkgW, len(vuln.PkgName))
+			verW = maxInt(verW, len(vuln.InstalledVersion))
+			fix := vuln.FixedVersion
+			if fix == "" {
+				fix = "sem fix"
+			}
+			fixW = maxInt(fixW, len(fix))
+			linkW = maxInt(linkW, len(vuln.PrimaryURL))
 		}
 
-		fixVersion := vuln.FixedVersion
-		if fixVersion == "" {
-			fixVersion = "sem fix"
-		}
-		if len(fixVersion) > 15 {
-			fixVersion = fixVersion[:12] + "..."
+		vulnSep := fmt.Sprintf("+%s+%s+%s+%s+%s+%s+",
+			strings.Repeat("-", sevW+2),
+			strings.Repeat("-", cveW+2),
+			strings.Repeat("-", pkgW+2),
+			strings.Repeat("-", verW+2),
+			strings.Repeat("-", fixW+2),
+			strings.Repeat("-", linkW+2))
+
+		rowFmt := fmt.Sprintf("| %%-%ds | %%-%ds | %%-%ds | %%-%ds | %%-%ds | %%-%ds |\n",
+			sevW, cveW, pkgW, verW, fixW, linkW)
+
+		fmt.Println(vulnSep)
+		fmt.Printf(rowFmt, "SEVER.", "CVE", "PACOTE", "VERSAO", "FIX", "LINK")
+		fmt.Println(vulnSep)
+
+		for i := 0; i < limit; i++ {
+			vuln := allVulns[i]
+			fix := vuln.FixedVersion
+			if fix == "" {
+				fix = "sem fix"
+			}
+			fmt.Printf(rowFmt,
+				vuln.Severity,
+				vuln.VulnerabilityID,
+				vuln.PkgName,
+				vuln.InstalledVersion,
+				fix,
+				vuln.PrimaryURL)
 		}
 
-		installedVersion := vuln.InstalledVersion
-		if len(installedVersion) > 15 {
-			installedVersion = installedVersion[:12] + "..."
+		fmt.Println(vulnSep)
+		if len(allVulns) > 20 {
+			fmt.Printf("... e mais %d vulnerabilidades\n", len(allVulns)-20)
 		}
-
-		fmt.Printf("%-10s %-18s %-25s %-15s %s\n",
-			vuln.Severity, vuln.VulnerabilityID, pkgName,
-			installedVersion, fixVersion)
-		shown++
+		fmt.Println("")
 	}
 
-	fmt.Println(strings.Repeat("-", 95))
+	// Tabela de SECRETS (larguras dinamicas)
+	if totalSecrets > 0 && !noSecrets {
+		fmt.Println("SECRETS EXPOSTOS")
 
-	if counts["CRITICAL"] > 0 {
+		sevW := len("SEVER.")
+		tipoW := len("TIPO")
+		arqW := len("ARQUIVO")
+
+		for _, s := range allSecrets {
+			sevW = maxInt(sevW, len(s.Severity))
+			tipoW = maxInt(tipoW, len(s.Title))
+			arqW = maxInt(arqW, len(s.Target))
+		}
+
+		secretSep := fmt.Sprintf("+%s+%s+%s+",
+			strings.Repeat("-", sevW+2),
+			strings.Repeat("-", tipoW+2),
+			strings.Repeat("-", arqW+2))
+
+		rowFmt := fmt.Sprintf("| %%-%ds | %%-%ds | %%-%ds |\n",
+			sevW, tipoW, arqW)
+
+		fmt.Println(secretSep)
+		fmt.Printf(rowFmt, "SEVER.", "TIPO", "ARQUIVO")
+		fmt.Println(secretSep)
+
+		for _, s := range allSecrets {
+			fmt.Printf(rowFmt, s.Severity, s.Title, s.Target)
+		}
+
+		fmt.Println(secretSep)
 		fmt.Println("")
-		fmt.Println("[ATENCAO] Vulnerabilidades CRITICAL encontradas!")
+	}
+
+	// Alerta final
+	if vulnCounts["CRITICAL"] > 0 || secretCounts["CRITICAL"] > 0 {
+		parts := []string{}
+		if vulnCounts["CRITICAL"] > 0 {
+			parts = append(parts, fmt.Sprintf("%d vulnerabilidade(s) CRITICAL", vulnCounts["CRITICAL"]))
+		}
+		if secretCounts["CRITICAL"] > 0 {
+			parts = append(parts, fmt.Sprintf("%d secret(s) CRITICAL", secretCounts["CRITICAL"]))
+		}
+		fmt.Printf("[ATENCAO] Encontrados %s!\n", strings.Join(parts, " + "))
 		fmt.Println("          Recomenda-se atualizar os pacotes afetados.")
 	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
